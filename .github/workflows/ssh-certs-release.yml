@@ -1,0 +1,389 @@
+name: Release Code - OSS (ssh-certs)
+
+# Watches microsoft/vscode for new stable releases and, for each one, rebuilds Code - OSS
+# with the ssh-certs fix commits replayed on top, publishing the binaries as a GitHub Release.
+
+on:
+  schedule:
+    - cron: "17 */3 * * *"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Upstream version tag to build (defaults to the latest microsoft/vscode release)
+        required: false
+        default: ""
+      force:
+        description: Rebuild even if a release already exists for this version
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ssh-certs-release
+  cancel-in-progress: false
+
+env:
+  # Branch holding the fix commits (replayed on top of each new upstream release)
+  FIX_BRANCH: stable-1.143.1-ssh-certs
+  # Branch holding fork-only build patches on top of FIX_BRANCH (.github changes are ignored)
+  PATCH_BRANCH: build/stable-1.143.1-ssh-certs
+  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+jobs:
+  check:
+    name: Check upstream release
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.check.outputs.version }}
+      sha: ${{ steps.check.outputs.sha }}
+      build: ${{ steps.check.outputs.build }}
+    steps:
+      - id: check
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+          INPUT_FORCE: ${{ inputs.force }}
+        run: |
+          set -euo pipefail
+          VER="${INPUT_VERSION:-$(gh api repos/microsoft/vscode/releases/latest --jq .tag_name)}"
+          SHA=$(gh api "repos/microsoft/vscode/commits/$VER" --jq .sha)
+          BUILD=true
+          if gh release view "ssh-certs-$VER" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1 && [ "$INPUT_FORCE" != "true" ]; then
+            BUILD=false
+          fi
+          echo "Upstream $VER ($SHA), build=$BUILD" | tee -a "$GITHUB_STEP_SUMMARY"
+          { echo "version=$VER"; echo "sha=$SHA"; echo "build=$BUILD"; } >> "$GITHUB_OUTPUT"
+
+  prepare:
+    name: Replay fixes on upstream
+    needs: check
+    if: needs.check.outputs.build == 'true'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: microsoft/vscode
+          ref: ${{ needs.check.outputs.version }}
+          fetch-depth: 1
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+
+      - name: Apply fix and build patches
+        env:
+          UPSTREAM_SHA: ${{ needs.check.outputs.sha }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git fetch --no-tags --depth=100 "https://github.com/$GITHUB_REPOSITORY" \
+            "+refs/heads/$FIX_BRANCH:refs/remotes/fork/fix" "+refs/heads/$PATCH_BRANCH:refs/remotes/fork/build"
+
+          BASE_VER=$(git show fork/fix:package.json | node -pe "JSON.parse(require('fs').readFileSync(0, 'utf8')).version")
+          BASE_SHA=$(gh api "repos/microsoft/vscode/commits/$BASE_VER" --jq .sha)
+          git cat-file -e "$BASE_SHA^{commit}" || { echo "::error::$FIX_BRANCH is not based on upstream $BASE_VER"; exit 1; }
+          COMMITS=$(git rev-list --reverse "$BASE_SHA..fork/fix")
+          [ "$(echo "$COMMITS" | wc -l)" -le 50 ] || { echo "::error::Too many commits between $BASE_VER and $FIX_BRANCH"; exit 1; }
+
+          # Re-points ssh2 at the fork in a manifest and regenerates its lockfile from upstream's
+          reapply_ssh2() {
+            local commit=$1 dir=$2 pj
+            pj=$([ "$dir" = . ] && echo package.json || echo "$dir/package.json")
+            local spec
+            spec=$(git show "$commit:$pj" | node -pe "JSON.parse(require('fs').readFileSync(0, 'utf8')).dependencies?.ssh2 ?? ''")
+            [ -n "$spec" ] || return 0
+            (cd "$dir" && npm pkg set "dependencies.ssh2=$spec" && npm install --package-lock-only --ignore-scripts --no-audit --no-fund)
+            git add "$pj" "${pj%package.json}package-lock.json"
+          }
+
+          for c in $COMMITS; do
+            echo "::group::Applying $(git log -1 --format='%h %s' "$c")"
+            if ! git cherry-pick -x "$c"; then
+              CONFLICTS=$(git diff --name-only --diff-filter=U)
+              if [ -z "$CONFLICTS" ]; then
+                echo "Already in upstream, skipping"
+                git cherry-pick --skip
+              else
+                for f in $CONFLICTS; do
+                  case "$f" in
+                    package.json|package-lock.json|remote/package.json|remote/package-lock.json) ;;
+                    *) echo "::error::Conflict in $f while applying $c; rebase $FIX_BRANCH manually"; exit 1 ;;
+                  esac
+                done
+                git checkout --ours -- $CONFLICTS
+                git add $CONFLICTS
+                reapply_ssh2 "$c" .
+                reapply_ssh2 "$c" remote
+                git -c core.editor=true cherry-pick --continue
+              fi
+            fi
+            echo "::endgroup::"
+          done
+
+          git diff --binary fork/fix fork/build -- . ':(exclude).github' > /tmp/build.patch
+          if [ -s /tmp/build.patch ]; then
+            git apply --3way --index /tmp/build.patch || { echo "::error::Build patches from $PATCH_BRANCH no longer apply"; exit 1; }
+            git commit -m "Fork build patches"
+          fi
+
+          git log --oneline "$UPSTREAM_SHA..HEAD" | tee -a "$GITHUB_STEP_SUMMARY"
+          git diff --binary "$UPSTREAM_SHA" HEAD > ssh-certs.patch
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ssh-certs-patch
+          path: ssh-certs.patch
+
+  linux:
+    name: Linux x64
+    needs: [check, prepare]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    env: &build-env
+      VSCODE_ARCH: x64
+      npm_config_arch: x64
+      npm_config_foreground_scripts: "true"
+      PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: 1
+      ELECTRON_SKIP_BINARY_DOWNLOAD: 1
+      # Report the upstream commit so remote agent hosts download the matching official CLI
+      BUILD_SOURCEVERSION: ${{ needs.check.outputs.sha }}
+      # Required by the Copilot extension build when BUILD_SOURCEVERSION is set
+      VSCODE_QUALITY: stable
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: microsoft/vscode
+          ref: ${{ needs.check.outputs.version }}
+          fetch-depth: 1
+          lfs: true
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: ssh-certs-patch
+          path: ${{ runner.temp }}
+
+      - name: Apply patch
+        run: git apply --binary "$RUNNER_TEMP/ssh-certs.patch"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+
+      - name: Install system dependencies
+        run: |
+          ./build/azure-pipelines/linux/apt-retry.sh sudo apt-get update
+          ./build/azure-pipelines/linux/apt-retry.sh sudo apt-get install -y pkg-config \
+            libxkbfile-dev libkrb5-dev libsecret-1-dev libx11-dev python-is-python3 fakeroot dpkg-dev rpm
+
+      - name: Install build dependencies
+        working-directory: build
+        run: |
+          for i in 1 2 3; do npm ci && break; [ $i -eq 3 ] && exit 1; sleep 5; done
+
+      # Uses the same Chromium clang + glibc 2.28 sysroot toolchain as upstream CI
+      - name: Install npm dependencies
+        run: |
+          set -e
+          source ./build/azure-pipelines/linux/setup-env.sh
+          for i in 1 2 3; do npm ci && break; [ $i -eq 3 ] && exit 1; sleep 5; done
+
+      - name: Build client
+        run: npm run gulp vscode-linux-x64-min
+
+      - name: Package tarball
+        run: |
+          mkdir -p dist
+          tar -czf dist/code-oss-linux-x64.tar.gz -C .. VSCode-linux-x64
+
+      - name: Build .rpm
+        continue-on-error: true
+        run: |
+          npm run gulp vscode-linux-x64-prepare-rpm
+          npm run gulp vscode-linux-x64-build-rpm
+          cp .build/linux/rpm/*/*.rpm dist/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: code-oss-linux-x64
+          path: dist/*
+          compression-level: 0
+
+  windows:
+    name: Windows x64
+    needs: [check, prepare]
+    runs-on: windows-2022
+    timeout-minutes: 240
+    env: *build-env
+    steps:
+      - name: Disable git autocrlf
+        run: git config --global core.autocrlf false
+
+      - uses: actions/checkout@v4
+        with:
+          repository: microsoft/vscode
+          ref: ${{ needs.check.outputs.version }}
+          fetch-depth: 1
+          lfs: true
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: ssh-certs-patch
+          path: ${{ runner.temp }}
+
+      - name: Apply patch
+        shell: bash
+        run: git apply --binary "$RUNNER_TEMP/ssh-certs.patch"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+
+      - name: Install npm dependencies
+        shell: pwsh
+        run: |
+          for ($i = 1; $i -le 3; $i++) {
+            npm ci
+            if ($LASTEXITCODE -eq 0) { break }
+            if ($i -eq 3) { throw "npm ci failed" }
+            Start-Sleep -Seconds 5
+          }
+
+      # The packaging step calls signtool.exe to strip stale signatures from native binaries
+      - name: Add Windows SDK signtool to PATH
+        shell: pwsh
+        run: |
+          $signtool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\signtool.exe" | Sort-Object FullName -Descending | Select-Object -First 1
+          if (-not $signtool) { throw "signtool.exe not found" }
+          Split-Path $signtool.FullName | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+
+      - name: Build client
+        shell: pwsh
+        run: |
+          npm run gulp vscode-win32-x64-min
+          if ($LASTEXITCODE -ne 0) { throw "build failed" }
+          npm run gulp vscode-win32-x64-inno-updater
+          if ($LASTEXITCODE -ne 0) { throw "inno-updater failed" }
+
+      - name: Package zip
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Compress-Archive -Path ..\VSCode-win32-x64\* -DestinationPath dist\code-oss-win32-x64.zip
+
+      - name: Build user installer
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          npm run gulp vscode-win32-x64-user-setup
+          if ($LASTEXITCODE -ne 0) { throw "user setup failed" }
+          Copy-Item .build\win32-x64\user-setup\*.exe dist\code-oss-win32-x64-user-setup.exe
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: code-oss-win32-x64
+          path: dist/*
+          compression-level: 0
+
+  macos:
+    name: macOS arm64
+    needs: [check, prepare]
+    runs-on: macos-15
+    timeout-minutes: 300
+    env:
+      VSCODE_ARCH: arm64
+      npm_config_arch: arm64
+      npm_config_foreground_scripts: "true"
+      PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: 1
+      ELECTRON_SKIP_BINARY_DOWNLOAD: 1
+      BUILD_SOURCEVERSION: ${{ needs.check.outputs.sha }}
+      VSCODE_QUALITY: stable
+      # Avoid dlopen-based Kerberos loading on macOS (matches upstream CI)
+      GYP_DEFINES: "kerberos_use_rtld=false"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: microsoft/vscode
+          ref: ${{ needs.check.outputs.version }}
+          fetch-depth: 1
+          lfs: true
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: ssh-certs-patch
+          path: ${{ runner.temp }}
+
+      - name: Apply patch
+        run: git apply --binary "$RUNNER_TEMP/ssh-certs.patch"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+
+      - name: Install npm dependencies
+        run: |
+          set -e
+          python3 -m pip install --break-system-packages setuptools
+          for i in 1 2 3; do npm ci && break; [ $i -eq 3 ] && exit 1; sleep 5; done
+
+      - name: Build client
+        run: npm run gulp vscode-darwin-arm64-min
+
+      # Unsigned binaries are rejected on Apple Silicon; an ad-hoc signature lets the app run locally
+      - name: Ad-hoc sign app
+        run: |
+          set -e
+          APP="$(ls -d ../VSCode-darwin-arm64/*.app)"
+          codesign --force --deep --sign - "$APP"
+          codesign --verify --deep --strict "$APP"
+
+      - name: Package zip
+        run: |
+          mkdir -p dist
+          ditto -c -k --sequesterRsrc --keepParent "$(ls -d ../VSCode-darwin-arm64/*.app)" dist/code-oss-darwin-arm64.zip
+
+      - name: Build .dmg
+        continue-on-error: true
+        run: |
+          set -e
+          mkdir -p .build/dmg
+          node build/darwin/create-dmg.ts .. "$PWD/.build/dmg"
+          cp .build/dmg/*.dmg dist/code-oss-darwin-arm64.dmg
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: code-oss-darwin-arm64
+          path: dist/*
+          compression-level: 0
+
+  release:
+    name: Publish release
+    needs: [check, prepare, linux, windows, macos]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create release
+        env:
+          VER: ${{ needs.check.outputs.version }}
+          SHA: ${{ needs.check.outputs.sha }}
+        run: |
+          set -euo pipefail
+          TAG="ssh-certs-$VER"
+          gh release delete "$TAG" -R "$GITHUB_REPOSITORY" --cleanup-tag --yes 2>/dev/null || true
+          cat > notes.md <<EOF
+          Code - OSS built from upstream [microsoft/vscode $VER](https://github.com/microsoft/vscode/releases/tag/$VER) (\`$SHA\`)
+          with the commits from \`$FIX_BRANCH\` replayed on top (see \`ssh-certs.patch\`).
+
+          Unsigned builds: on macOS run \`xattr -dr com.apple.quarantine "/Applications/Code - OSS.app"\` after installing.
+          EOF
+          ls -la dist
+          gh release create "$TAG" -R "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+            --title "Code - OSS $VER (ssh-certs)" --notes-file notes.md dist/*
