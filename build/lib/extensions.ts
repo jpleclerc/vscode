@@ -480,16 +480,25 @@ export function packageCopilotExtensionStream(): Stream {
 	const dependenciesSrc = productionDependencies.map(d => path.relative(root, d)).map(d => [`${d}/**`, `!${d}/**/{test,tests}/**`]).flat();
 
 	// build/.moduleignore strips `@github/copilot/**` for the core app, but the copilot
-	// extension needs its own copy (the SDK is pruned per-platform later on).
-	const keepCopilotSdk = filter(['**', '!**/extensions/copilot/node_modules/@github/copilot/**'], { restore: true, dot: true });
+	// extension needs its SDK. Mirror extensions/copilot/.vscodeignore: ship only
+	// package.json + sdk/**, minus natives for other OSes (prebuilds are pruned later).
+	const copilotPackageDir = 'extensions/copilot/node_modules/@github/copilot';
+	const otherOses = ['darwin', 'linux', 'win32'].filter(os => os !== process.platform).join('|');
+	const copilotSdkSrc = fs.existsSync(path.join(root, copilotPackageDir, 'sdk'))
+		? gulp.src([
+			`${copilotPackageDir}/package.json`,
+			`${copilotPackageDir}/sdk/**`,
+			`!${copilotPackageDir}/sdk/**/*@(${otherOses})*/**`,
+			`!${copilotPackageDir}/sdk/**/*@(${otherOses})*.node`,
+		], { base: '.' })
+		: es.readArray([]);
 
 	return es.merge(
 		localExtensionsStream,
 		gulp.src(dependenciesSrc, { base: '.' })
-			.pipe(keepCopilotSdk)
 			.pipe(util2.cleanNodeModules(path.join(root, 'build', '.moduleignore')))
-			.pipe(util2.cleanNodeModules(path.join(root, 'build', `.moduleignore.${process.platform}`)))
-			.pipe(keepCopilotSdk.restore)
+			.pipe(util2.cleanNodeModules(path.join(root, 'build', `.moduleignore.${process.platform}`))),
+		copilotSdkSrc
 	).pipe(util2.setExecutableBit(['**/*.sh']));
 }
 
