@@ -482,16 +482,38 @@ export function packageCopilotExtensionStream(): Stream {
 	// build/.moduleignore strips `@github/copilot/**` for the core app, but the copilot
 	// extension needs its SDK. Mirror extensions/copilot/.vscodeignore: ship only
 	// package.json + sdk/**, minus natives for other OSes (prebuilds are pruned later).
-	const copilotPackageDir = 'extensions/copilot/node_modules/@github/copilot';
-	const otherOses = ['darwin', 'linux', 'win32'].filter(os => os !== process.platform).join('|');
-	const copilotSdkSrc = fs.existsSync(path.join(root, copilotPackageDir, 'sdk'))
-		? gulp.src([
-			`${copilotPackageDir}/package.json`,
-			`${copilotPackageDir}/sdk/**`,
-			`!${copilotPackageDir}/sdk/**/*@(${otherOses})*/**`,
-			`!${copilotPackageDir}/sdk/**/*@(${otherOses})*.node`,
-		], { base: '.' })
-		: es.readArray([]);
+	const copilotPackageDir = path.join(root, 'extensions', 'copilot', 'node_modules', '@github', 'copilot');
+	const otherOsPattern = new RegExp(['darwin', 'linux', 'win32'].filter(os => os !== process.platform).join('|'));
+	const copilotSdkFiles: string[] = [];
+	const collectSdkFiles = (dir: string) => {
+		for (const entry of fs.readdirSync(dir)) {
+			const fullPath = path.join(dir, entry);
+			let stat: fs.Stats;
+			try {
+				stat = fs.statSync(fullPath);
+			} catch (err) {
+				fancyLog.warn(`[packageCopilotExtensionStream] Skipping unreadable ${fullPath}: ${err}`);
+				continue;
+			}
+			if (stat.isDirectory()) {
+				if (!otherOsPattern.test(entry)) {
+					collectSdkFiles(fullPath);
+				}
+			} else if (!(entry.endsWith('.node') && otherOsPattern.test(entry))) {
+				copilotSdkFiles.push(fullPath);
+			}
+		}
+	};
+	if (fs.existsSync(path.join(copilotPackageDir, 'sdk'))) {
+		copilotSdkFiles.push(path.join(copilotPackageDir, 'package.json'));
+		collectSdkFiles(path.join(copilotPackageDir, 'sdk'));
+	}
+	const copilotSdkSrc = es.readArray(copilotSdkFiles.map(filePath => new File({
+		path: filePath,
+		stat: fs.statSync(filePath),
+		base: root,
+		contents: fs.readFileSync(filePath)
+	})));
 
 	return es.merge(
 		localExtensionsStream,
