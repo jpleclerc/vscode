@@ -55,7 +55,7 @@ jobs:
         run: node build/npm/electronTypes.ts
 
       - name: Typecheck
-        run: npm run typecheck
+        run: npm exec -- npm-run-all2 -lp typecheck-client tsec-compile-check
 
       - name: Hygiene and ESLint (changed files)
         if: always()
