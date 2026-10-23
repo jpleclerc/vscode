@@ -181,6 +181,8 @@ jobs:
 
       - name: Build .dmg
         continue-on-error: true
+        env:
+          VSCODE_QUALITY: stable
         run: |
           set -e
           node build/darwin/create-dmg.ts .. "$PWD/.build/dmg"
