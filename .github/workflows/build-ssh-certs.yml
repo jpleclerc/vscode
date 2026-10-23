@@ -1,0 +1,128 @@
+name: Build Code - OSS (ssh-certs)
+
+on:
+  push:
+    branches:
+      - build/stable-1.143.1-ssh-certs
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  VSCODE_ARCH: x64
+  npm_config_arch: x64
+  npm_config_foreground_scripts: "true"
+  PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: 1
+  ELECTRON_SKIP_BINARY_DOWNLOAD: 1
+  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+jobs:
+  linux:
+    name: Linux x64
+    runs-on: ubuntu-22.04
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          lfs: true
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential g++ libx11-dev libxkbfile-dev libsecret-1-dev libkrb5-dev python-is-python3 fakeroot dpkg-dev rpm
+
+      - name: Install npm dependencies
+        run: |
+          for i in 1 2 3; do npm ci && break || { echo "npm ci failed (attempt $i)"; sleep 5; }; done
+          test -d node_modules/gulp
+
+      - name: Build client
+        run: npm run gulp vscode-linux-x64-min
+
+      - name: Package tarball
+        run: |
+          mkdir -p dist
+          tar -czf dist/code-oss-linux-x64.tar.gz -C .. VSCode-linux-x64
+
+      - name: Build .deb
+        continue-on-error: true
+        run: |
+          npm run gulp vscode-linux-x64-prepare-deb
+          npm run gulp vscode-linux-x64-build-deb
+          cp .build/linux/deb/*/deb/*.deb dist/
+
+      - name: Build .rpm
+        continue-on-error: true
+        run: |
+          npm run gulp vscode-linux-x64-prepare-rpm
+          npm run gulp vscode-linux-x64-build-rpm
+          cp .build/linux/rpm/*/*.rpm dist/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: code-oss-linux-x64
+          path: dist/*
+          compression-level: 0
+
+  windows:
+    name: Windows x64
+    runs-on: windows-2022
+    timeout-minutes: 240
+    steps:
+      - name: Disable git autocrlf
+        run: git config --global core.autocrlf false
+
+      - uses: actions/checkout@v4
+        with:
+          lfs: true
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+
+      - name: Install npm dependencies
+        shell: pwsh
+        run: |
+          for ($i = 1; $i -le 3; $i++) {
+            npm ci
+            if ($LASTEXITCODE -eq 0) { break }
+            if ($i -eq 3) { throw "npm ci failed" }
+            Start-Sleep -Seconds 5
+          }
+
+      - name: Build client
+        shell: pwsh
+        run: |
+          npm run gulp vscode-win32-x64-min
+          if ($LASTEXITCODE -ne 0) { throw "build failed" }
+          npm run gulp vscode-win32-x64-inno-updater
+          if ($LASTEXITCODE -ne 0) { throw "inno-updater failed" }
+
+      - name: Package zip
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Compress-Archive -Path ..\VSCode-win32-x64\* -DestinationPath dist\code-oss-win32-x64.zip
+
+      - name: Build user installer
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          npm run gulp vscode-win32-x64-user-setup
+          if ($LASTEXITCODE -ne 0) { throw "user setup failed" }
+          Copy-Item .build\win32-x64\user-setup\*.exe dist\
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: code-oss-win32-x64
+          path: dist/*
+          compression-level: 0
