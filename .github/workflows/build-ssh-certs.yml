@@ -103,6 +103,14 @@ jobs:
             Start-Sleep -Seconds 5
           }
 
+      # The packaging step calls signtool.exe to strip stale signatures from native binaries
+      - name: Add Windows SDK signtool to PATH
+        shell: pwsh
+        run: |
+          $signtool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\signtool.exe" | Sort-Object FullName -Descending | Select-Object -First 1
+          if (-not $signtool) { throw "signtool.exe not found" }
+          Split-Path $signtool.FullName | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+
       - name: Build client
         shell: pwsh
         run: |
