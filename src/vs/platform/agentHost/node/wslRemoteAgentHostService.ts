@@ -121,7 +121,7 @@ export class WSLRemoteAgentHostMainService extends Disposable implements IWSLRem
 	}
 
 	private get _quality(): string {
-		return this._productService.quality || 'insider';
+		return this._productService.quality || 'stable';
 	}
 
 	private get _serverDataFolderName(): string {
