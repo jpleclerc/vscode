@@ -138,3 +138,56 @@ jobs:
           name: code-oss-win32-x64
           path: dist/*
           compression-level: 0
+
+  macos:
+    name: macOS arm64
+    runs-on: macos-15
+    timeout-minutes: 300
+    env:
+      VSCODE_ARCH: arm64
+      npm_config_arch: arm64
+      # Avoid dlopen-based Kerberos loading on macOS (matches upstream CI)
+      GYP_DEFINES: "kerberos_use_rtld=false"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          lfs: true
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+
+      - name: Install npm dependencies
+        run: |
+          set -e
+          python3 -m pip install --break-system-packages setuptools
+          for i in 1 2 3; do npm ci && break; [ $i -eq 3 ] && exit 1; sleep 5; done
+
+      - name: Build client
+        run: npm run gulp vscode-darwin-arm64-min
+
+      # Unsigned binaries are rejected on Apple Silicon; an ad-hoc signature lets the app run locally
+      - name: Ad-hoc sign app
+        run: |
+          set -e
+          APP="$(ls -d ../VSCode-darwin-arm64/*.app)"
+          codesign --force --deep --sign - "$APP"
+          codesign --verify --deep --strict "$APP"
+
+      - name: Package zip
+        run: |
+          mkdir -p dist
+          ditto -c -k --sequesterRsrc --keepParent "$(ls -d ../VSCode-darwin-arm64/*.app)" dist/code-oss-darwin-arm64.zip
+
+      - name: Build .dmg
+        continue-on-error: true
+        run: |
+          set -e
+          node build/darwin/create-dmg.ts .. "$PWD/.build/dmg"
+          cp .build/dmg/*.dmg dist/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: code-oss-darwin-arm64
+          path: dist/*
+          compression-level: 0
